@@ -61,10 +61,14 @@
     % 3. 理论寻优偏好与约束。
     userPref = make_es_optimizer_preference();
     userPref = apply_struct_override(userPref, get_opt(runOpt, 'userPref', struct()));
+    userPref = apply_optimizer_override(userPref, get_opt(runOpt, 'optimizer', struct()));
 
     % 4. 前向链路选项。
     fwdOpt = make_forward_options();
     fwdOpt = apply_struct_override(fwdOpt, get_opt(runOpt, 'fwdOpt', struct()));
+    if quietMode
+        fwdOpt.verbose = false;
+    end
 
     % 5. 构造真实场景、空间相关 Es 斑块、固定子路径集合。
     scene = build_scene_from_sceneSpec(sceneSpec);
@@ -167,7 +171,7 @@ function [P, T] = build_pareto_table(candidateTable)
         P = T(isPareto,:);
         return;
     end
-    vals = [T.scanTimeSec(eligibleIdx), T.resolutionCost(eligibleIdx), -T.EsCoverage(eligibleIdx), -T.observabilityScore(eligibleIdx)];
+    vals = [T.scanTimeSec(eligibleIdx), T.resolutionCost(eligibleIdx), -T.observabilityScore(eligibleIdx), T.complexityCost(eligibleIdx)];
     localPareto = true(numel(eligibleIdx), 1);
     for i = 1:numel(eligibleIdx)
         for j = 1:numel(eligibleIdx)
@@ -237,15 +241,15 @@ end
 function [row, rankIdx] = select_task_pareto_row(T, pref)
     switch get_opt(pref, 'selectionMode', 'balanced')
         case 'fast'
-            [row, rankIdx] = select_sorted_pareto_row(T, {'scanTimeSec','negEsCoverage','negObservabilityScore','dfMHz','originalOrder'});
+            [row, rankIdx] = select_sorted_pareto_row(T, {'scanTimeSec','negObservabilityScore','complexityCost','dfMHz','originalOrder'});
         case 'foes'
             [row, rankIdx] = select_sorted_pareto_row(T, {'dfMHz','scanTimeSec','negIntegrationGainDb','heightResolutionKm','originalOrder'});
         case 'height'
             [row, rankIdx] = select_sorted_pareto_row(T, {'heightResolutionKm','negIntegrationGainDb','scanTimeSec','dfMHz','originalOrder'});
         case 'weak'
-            [row, rankIdx] = select_sorted_pareto_row(T, {'negObservabilityScore','negIntegrationGainDb','scanTimeSec','resolutionCost','originalOrder'});
+            [row, rankIdx] = select_sorted_pareto_row(T, {'negObservabilityScore','negIntegrationGainDb','scanTimeSec','complexityCost','originalOrder'});
         case 'full_trace'
-            [row, rankIdx] = select_sorted_pareto_row(T, {'negEsCoverage','nFreqDescending','resolutionCost','scanTimeSec','originalOrder'});
+            [row, rankIdx] = select_sorted_pareto_row(T, {'nFreqDescending','dfMHz','resolutionCost','negObservabilityScore','scanTimeSec','originalOrder'});
         otherwise
             [row, rankIdx] = select_lexicographic_pareto_row(T);
     end
@@ -265,7 +269,6 @@ function [row, rankIdx] = select_sorted_pareto_row(T, sortNames)
 end
 
 function S = add_task_sort_columns(S)
-    S.negEsCoverage = -S.EsCoverage;
     S.negObservabilityScore = -S.observabilityScore;
     S.negIntegrationGainDb = -S.integrationGainDb;
     S.nFreqDescending = -S.nFreq;
@@ -281,7 +284,6 @@ function T2 = filter_es_reliable_pareto_candidates(T, pref)
         minFreq = pref.minFrequencySamples;
     end
     ok = T.optimizationFeasible & ...
-        T.EsCoverage >= pref.minEsCoverage & ...
         T.integrationGainDb >= pref.minIntegrationGainDb & ...
         T.nFreq >= minFreq;
     T2 = T(ok,:);
@@ -292,30 +294,8 @@ function T2 = filter_non_degenerate_theoretical_candidates(T, baseCfg, pref)
         T2 = T([]);
         return;
     end
-    initialScanTime = estimate_strategy_scan_time(baseCfg);
-    targetMaxScan = min(pref.maxAdaptiveScanTimeSec, 0.50*initialScanTime);
-    minUsefulScan = 0.08;
-    usefulDfLo = max(pref.bounds.dfMHz(1), 0.04);
-    usefulChipLo = max(pref.bounds.chipLength(1), 10e-6);
-    if strcmpi(pref.taskMode, 'foes_read')
-        usefulDfLo = pref.bounds.dfMHz(1);
-        targetMaxScan = min(pref.maxAdaptiveScanTimeSec, 0.60*initialScanTime);
-    elseif strcmpi(pref.taskMode, 'fast_detection')
-        targetMaxScan = min(pref.maxAdaptiveScanTimeSec, 0.35*initialScanTime);
-        usefulDfLo = max(pref.bounds.dfMHz(1), 0.08);
-    elseif strcmpi(pref.taskMode, 'height_stable')
-        usefulChipLo = pref.bounds.chipLength(1);
-    elseif strcmpi(pref.taskMode, 'weak_es_visibility') || strcmpi(pref.taskMode, 'full_trace')
-        targetMaxScan = min(pref.maxAdaptiveScanTimeSec, 0.80*initialScanTime);
-    end
-
-    ok = T.scanTimeSec <= targetMaxScan & ...                           % avoid unlimited resource stacking
-        T.scanTimeSec >= minUsefulScan & ...                            % avoid zero-information ultra-short scans
-        T.dfMHz >= usefulDfLo & ...                                     % avoid asymptotically fine frequency sampling
-        T.chipLength >= usefulChipLo & ...                              % avoid asymptotically fine height sampling
-        T.Ncoh <= 0.75*pref.NcohIntegerRange(2) & ...                   % avoid brute-force coherent accumulation
-        T.nFreq >= min_required_task_frequency_samples(pref) & ...
-        T.EsCoverage >= pref.minEsCoverage;
+    %#ok<INUSD>  % baseCfg is retained for the existing call interface.
+    ok = T.optimizationFeasible & T.nFreq >= min_required_task_frequency_samples(pref);
     T2 = T(ok,:);
 end
 
@@ -353,18 +333,17 @@ function [row, rankIdx] = select_lexicographic_pareto_row(T)
     if ~isempty(lowCost)
         S = lowCost;
     end
-    S.negEsCoverage = -S.EsCoverage;
     S.negObservabilityScore = -S.observabilityScore;
     S.absCost = abs(S.cost);
     S.originalOrder = (1:height(S))';
-    S = sortrows(S, {'negEsCoverage', 'resolutionCost', 'scanTimeSec', ...
+    S = sortrows(S, {'scanTimeSec', 'resolutionCost', ...
         'negObservabilityScore', 'absCost', 'originalOrder'});
     row = S(1, T.Properties.VariableNames);
     rankIdx = S.originalOrder(1);
 end
 
 function score = pareto_knee_score(T)
-    objectives = [T.scanTimeSec, T.resolutionCost, -T.EsCoverage, -T.observabilityScore];
+    objectives = [T.scanTimeSec, T.resolutionCost, -T.observabilityScore, T.complexityCost];
     mins = min(objectives, [], 1);
     maxs = max(objectives, [], 1);
     span = max(maxs - mins, eps);
@@ -425,6 +404,33 @@ function s = apply_struct_override(s, override)
         else
             s.(name) = override.(name);
         end
+    end
+end
+
+function pref = apply_optimizer_override(pref, override)
+    if ~isstruct(override) || isempty(fieldnames(override))
+        return;
+    end
+    if isfield(override, 'populationSize')
+        pref.nsga2.populationSize = override.populationSize;
+    end
+    if isfield(override, 'maxGenerations')
+        pref.nsga2.nGenerations = override.maxGenerations;
+    end
+    if isfield(override, 'nGenerations')
+        pref.nsga2.nGenerations = override.nGenerations;
+    end
+    if isfield(override, 'seed')
+        pref.nsga2.seed = override.seed;
+    end
+    if isfield(override, 'crossoverProbability')
+        pref.nsga2.crossoverProbability = override.crossoverProbability;
+    end
+    if isfield(override, 'mutationProbability')
+        pref.nsga2.mutationProbability = override.mutationProbability;
+    end
+    if isfield(override, 'nsga2')
+        pref.nsga2 = apply_struct_override(pref.nsga2, override.nsga2);
     end
 end
 
@@ -556,20 +562,13 @@ function pref = make_es_optimizer_preference()
     pref.maxPreferredScanTimeSec = 1.2;
     pref.maxAdaptiveScanTimeSec = 3.0;
     pref.maxPreferredDfMHz = 0.28;
-    pref.minEsCoverage = 0.90;
     pref.minIntegrationGainDb = 18.0;
     pref.minFrequencySamples = 10;
-    pref.maxAggressiveShrinkRatio = 0.45;
 
     % Es 目标区域构造。
-    pref.target.EsMarginLowMHz = 1.6;
-    pref.target.EsMarginHighMHz = 0.8;
-    pref.target.BackgroundMarginMHz = 0.4;
-    pref.target.minSpanMHz = 1.2;
     pref.target.iriPriorStartFlexMHz = 0.45;
     pref.target.iriPriorEndFlexMHz = 0.55;
-    pref.target.foEsNarrowLowMHz = 0.50;
-    pref.target.foEsNarrowHighMHz = NaN;
+    pref.target.userMarginMHz = 0.50;
 
     % Es 强度软阈值，用初探 foEs 连续调节偏好强度。
     pref.softThreshold.foEsMHz.x0 = 4.5;
@@ -1275,6 +1274,7 @@ function pp = default_preprocess_param_native()
     pp.midThreshold = 4.0;
     pp.strongThreshold = 6.0;
     pp.EsBandKm = [85, 150];
+    pp.EBandKm = [85, 125];
 end
 
 function pre = preprocess_ionogram_native(fMHz, hKm, ionogram, pp)
@@ -1305,6 +1305,7 @@ function pre = preprocess_ionogram_native(fMHz, hKm, ionogram, pp)
     maskMid = continuity_filter(SNRs > pp.midThreshold, 2, 2);
     maskStrong = continuity_filter(SNRs > pp.strongThreshold, 2, 2);
 
+    eBand = hKm >= pp.EBandKm(1) & hKm <= pp.EBandKm(2);
     esBand = hKm >= pp.EsBandKm(1) & hKm <= pp.EsBandKm(2);
     pre = struct();
     pre.param = pp;
@@ -1318,6 +1319,7 @@ function pre = preprocess_ionogram_native(fMHz, hKm, ionogram, pp)
     pre.maskWeak = maskWeak;
     pre.maskMid = maskMid;
     pre.maskStrong = maskStrong;
+    pre.E = band_descriptors(fMHz, hKm, SNRs, maskWeak, maskMid, maskStrong, eBand);
     pre.Es = band_descriptors(fMHz, hKm, SNRs, maskWeak, maskMid, maskStrong, esBand);
     pre.note = 'Native-grid preprocessing. No cross-strategy interpolation.';
 end
@@ -1355,6 +1357,11 @@ function feature = extract_es_features(pre)
     weakActive = pre.Es.activeWeak;
     heightEstimate = robust_es_height_estimate(pre, active);
     feature = struct();
+    feature.E.observable = any(pre.E.activeMid);
+    feature.E.foEObservedRawMHz = max_freq(f, pre.E.activeMid);
+    feature.E.activeMidFreqMHz = f(pre.E.activeMid);
+    feature.E.meanSNR = mean_finite(pre.E.ridgeSNR(pre.E.activeMid));
+    feature.E.traceContinuity = trace_continuity(f, pre.E.activeMid);
     feature.Es.observable = any(active);
     feature.Es.foEsMHz = max_freq(f, active);
     feature.Es.hEsPrimeKm = heightEstimate.hKm;
@@ -1366,8 +1373,8 @@ function feature = extract_es_features(pre)
     feature.Es.weakEdgeWidthMHz = max(0, freq_span(f, weakActive) - freq_span(f, active));
     feature.Es.heightWidthKm = median_finite(pre.Es.heightWidthWeakKm(active));
     feature.Quality.contrastDb = max(pre.IdB(:)) - median(pre.IdB(:));
-    feature.summaryTable = table(feature.Es.observable, feature.Es.foEsMHz, feature.Es.hEsPrimeKm, feature.Es.traceContinuity, feature.Es.meanSNR, feature.Quality.contrastDb, ...
-        'VariableNames', {'EsObservable','foEsMHz','hEsPrimeKm','EsContinuity','EsMeanSNR','ContrastDb'});
+    feature.summaryTable = table(feature.E.observable, feature.E.foEObservedRawMHz, feature.Es.observable, feature.Es.foEsMHz, feature.Es.hEsPrimeKm, feature.Es.traceContinuity, feature.Es.meanSNR, feature.Quality.contrastDb, ...
+        'VariableNames', {'EObservable','foEObservedRawMHz','EsObservable','foEsMHz','hEsPrimeKm','EsContinuity','EsMeanSNR','ContrastDb'});
 end
 
 function est = robust_es_height_estimate(pre, active)
@@ -1509,10 +1516,8 @@ function pref = resolve_es_task_preference(pref, initialCfg, initialFeature)
     pref.maxPreferredDfMHz = profile.maxPreferredDfMHz;
     pref.maxPreferredHeightResolutionKm = profile.maxPreferredHeightResolutionKm;
     pref.minPreferredNcoh = profile.minPreferredNcoh;
-    pref.minEsCoverage = profile.minEsCoverage;
     pref.minIntegrationGainDb = profile.minIntegrationGainDb;
     pref.minFrequencySamples = profile.minFrequencySamples;
-    pref.maxAggressiveShrinkRatio = profile.maxAggressiveShrinkRatio;
     pref.referenceDfMHz = profile.referenceDfMHz;
     pref.referenceHeightResolutionKm = profile.referenceHeightResolutionKm;
     pref.objectiveMode = profile.objectiveMode;
@@ -1521,25 +1526,15 @@ function pref = resolve_es_task_preference(pref, initialCfg, initialFeature)
     pref.freezeFrequencyWindow = profile.freezeFrequencyWindow;
     pref.preferredCodeType = profile.preferredCodeType;
 
-    if isfield(profile, 'codeTypeSet') && ~isempty(profile.codeTypeSet)
-        pref.codeTypeSet = profile.codeTypeSet;
-        pref.codeLengthSet = profile.codeLengthSet;
-    end
-    if isfield(profile, 'NcohIntegerRange') && ~isempty(profile.NcohIntegerRange)
-        pref.NcohIntegerRange = profile.NcohIntegerRange;
-    end
-    if isfield(profile, 'bounds')
-        pref.bounds = apply_struct_override(pref.bounds, profile.bounds);
-    end
     pref.target = apply_struct_override(pref.target, profile.target);
 
-    if strcmpi(mode, 'foes_read') && ~isfinite(pref.target.foEsNarrowHighMHz)
-        pref.target.foEsNarrowHighMHz = max(initialCfg.dfMHz, 0.20);
+    if ~isfield(pref.target, 'userMarginMHz') || ~isfinite(pref.target.userMarginMHz)
+        pref.target.userMarginMHz = 0.50;
     end
-
     profile.effectiveTaskMode = mode;
     profile.initialFoEsMHz = initialFeature.Es.foEsMHz;
     profile.initialDfMHz = initialCfg.dfMHz;
+    profile.initialScanTimeSec = estimate_strategy_scan_time(initialCfg);
     pref.taskProfile = profile;
 end
 
@@ -1568,13 +1563,10 @@ end
 function profile = make_es_task_profile(mode)
     profile = struct();
     profile.name = mode;
-    profile.freezeFrequencyWindow = false;
+    profile.freezeFrequencyWindow = true;
     profile.preferredCodeType = 'none';
-    profile.codeTypeSet = {};
-    profile.codeLengthSet = [];
-    profile.NcohIntegerRange = [];
-    profile.bounds = struct();
     profile.target = struct();
+    profile.baseline = struct();
 
     switch mode
         case 'fast_detection'
@@ -1588,20 +1580,14 @@ function profile = make_es_task_profile(mode)
             profile.maxPreferredDfMHz = 0.40;
             profile.maxPreferredHeightResolutionKm = 4.5;
             profile.minPreferredNcoh = 4;
-            profile.minEsCoverage = 0.72;
             profile.minIntegrationGainDb = 13.5;
             profile.minFrequencySamples = 5;
-            profile.maxAggressiveShrinkRatio = 0.18;
             profile.referenceDfMHz = 0.22;
             profile.referenceHeightResolutionKm = 3.5;
             profile.preferredCodeType = 'barker';
-            profile.codeTypeSet = {'barker'};
-            profile.codeLengthSet = 13;
-            profile.NcohIntegerRange = [4, 20];
-            profile.target.EsMarginLowMHz = 0.70;
-            profile.target.EsMarginHighMHz = 0.40;
-            profile.target.BackgroundMarginMHz = 0.20;
-            profile.target.minSpanMHz = 0.70;
+            profile.baseline = struct('maxScanTimeSec', 1.20, 'scanTimeRatioToInitial', 0.35, ...
+                'minFrequencySamples', 5, 'minIntegrationGainDb', 13.5, ...
+                'minObservabilityScore', 0.55, 'maxDfMHz', 0.40);
             profile.target.iriPriorStartFlexMHz = 0.20;
             profile.target.iriPriorEndFlexMHz = 0.20;
 
@@ -1617,18 +1603,15 @@ function profile = make_es_task_profile(mode)
             profile.maxPreferredDfMHz = 0.12;
             profile.maxPreferredHeightResolutionKm = 4.0;
             profile.minPreferredNcoh = 6;
-            profile.minEsCoverage = 0.98;
             profile.minIntegrationGainDb = 15.0;
             profile.minFrequencySamples = 8;
-            profile.maxAggressiveShrinkRatio = 0.10;
             profile.referenceDfMHz = 0.05;
             profile.referenceHeightResolutionKm = 3.5;
-            profile.target.foEsNarrowLowMHz = 0.50;
-            profile.target.foEsNarrowHighMHz = NaN;
-            profile.target.minSpanMHz = 0.80;
+            profile.baseline = struct('maxScanTimeSec', 2.60, 'scanTimeRatioToInitial', 0.60, ...
+                'minFrequencySamples', 8, 'minIntegrationGainDb', 15.0, ...
+                'minObservabilityScore', 0.58, 'maxDfMHz', 0.12);
             profile.target.iriPriorStartFlexMHz = 0.00;
             profile.target.iriPriorEndFlexMHz = 0.00;
-            profile.bounds.dfMHz = [0.02, 0.18];
 
         case 'height_stable'
             profile.displayName = 'Height-stable Es Mode';
@@ -1641,16 +1624,14 @@ function profile = make_es_task_profile(mode)
             profile.maxPreferredDfMHz = 0.25;
             profile.maxPreferredHeightResolutionKm = 2.3;
             profile.minPreferredNcoh = 8;
-            profile.minEsCoverage = 0.88;
             profile.minIntegrationGainDb = 17.0;
             profile.minFrequencySamples = 9;
-            profile.maxAggressiveShrinkRatio = 0.35;
             profile.referenceDfMHz = 0.16;
             profile.referenceHeightResolutionKm = 1.6;
-            profile.target.EsMarginLowMHz = 1.20;
-            profile.target.EsMarginHighMHz = 0.70;
-            profile.target.minSpanMHz = 1.10;
-            profile.bounds.chipLength = [8e-6, 24e-6];
+            profile.baseline = struct('maxScanTimeSec', 4.00, 'scanTimeRatioToInitial', 0.80, ...
+                'minFrequencySamples', 9, 'minIntegrationGainDb', 17.0, ...
+                'minObservabilityScore', 0.62, 'maxDfMHz', 0.25, ...
+                'maxHeightResolutionKm', 2.3);
 
         case 'weak_es_visibility'
             profile.displayName = 'Weak Es Visibility Mode';
@@ -1663,17 +1644,14 @@ function profile = make_es_task_profile(mode)
             profile.maxPreferredDfMHz = 0.22;
             profile.maxPreferredHeightResolutionKm = 3.2;
             profile.minPreferredNcoh = 14;
-            profile.minEsCoverage = 0.92;
             profile.minIntegrationGainDb = 21.0;
             profile.minFrequencySamples = 10;
-            profile.maxAggressiveShrinkRatio = 0.40;
             profile.referenceDfMHz = 0.14;
             profile.referenceHeightResolutionKm = 2.4;
             profile.preferredCodeType = 'complementary';
-            profile.NcohIntegerRange = [10, 56];
-            profile.target.EsMarginLowMHz = 1.40;
-            profile.target.EsMarginHighMHz = 0.90;
-            profile.target.minSpanMHz = 1.30;
+            profile.baseline = struct('maxScanTimeSec', 5.50, 'scanTimeRatioToInitial', 0.90, ...
+                'minFrequencySamples', 10, 'minIntegrationGainDb', 21.0, ...
+                'minObservabilityScore', 0.72, 'maxDfMHz', 0.22);
 
         case 'full_trace'
             profile.displayName = 'Complete Es Trace Mode';
@@ -1686,16 +1664,14 @@ function profile = make_es_task_profile(mode)
             profile.maxPreferredDfMHz = 0.20;
             profile.maxPreferredHeightResolutionKm = 3.0;
             profile.minPreferredNcoh = 10;
-            profile.minEsCoverage = 0.96;
             profile.minIntegrationGainDb = 18.5;
             profile.minFrequencySamples = 14;
-            profile.maxAggressiveShrinkRatio = 0.55;
             profile.referenceDfMHz = 0.12;
             profile.referenceHeightResolutionKm = 2.0;
-            profile.target.EsMarginLowMHz = 1.80;
-            profile.target.EsMarginHighMHz = 1.00;
-            profile.target.BackgroundMarginMHz = 0.50;
-            profile.target.minSpanMHz = 1.60;
+            profile.baseline = struct('maxScanTimeSec', 6.00, 'scanTimeRatioToInitial', 0.90, ...
+                'minFrequencySamples', 14, 'minIntegrationGainDb', 18.5, ...
+                'minObservabilityScore', 0.65, 'maxDfMHz', 0.20, ...
+                'maxHeightResolutionKm', 3.0);
             profile.target.iriPriorStartFlexMHz = 0.50;
             profile.target.iriPriorEndFlexMHz = 0.70;
 
@@ -1710,16 +1686,14 @@ function profile = make_es_task_profile(mode)
             profile.maxPreferredDfMHz = 0.28;
             profile.maxPreferredHeightResolutionKm = 3.1;
             profile.minPreferredNcoh = 4;
-            profile.minEsCoverage = 0.90;
             profile.minIntegrationGainDb = 18.0;
             profile.minFrequencySamples = 10;
-            profile.maxAggressiveShrinkRatio = 0.45;
             profile.referenceDfMHz = 0.10;
             profile.referenceHeightResolutionKm = 2.0;
-            profile.target.EsMarginLowMHz = 1.6;
-            profile.target.EsMarginHighMHz = 0.8;
-            profile.target.BackgroundMarginMHz = 0.4;
-            profile.target.minSpanMHz = 1.2;
+            profile.baseline = struct('maxScanTimeSec', 3.00, 'scanTimeRatioToInitial', 0.70, ...
+                'minFrequencySamples', 10, 'minIntegrationGainDb', 18.0, ...
+                'minObservabilityScore', 0.60, 'maxDfMHz', 0.28, ...
+                'maxHeightResolutionKm', 3.1);
             profile.target.iriPriorStartFlexMHz = 0.45;
             profile.target.iriPriorEndFlexMHz = 0.55;
     end
@@ -1788,12 +1762,12 @@ end
 function row = es_candidate_row(cfg, metric, cost, breakdown, cons, nsgaRank, crowdingDistance, constraintViolation, generation)
     row = {cfg.codeType, cfg.codeLength, cfg.Ncoh, cfg.fStartMHz, cfg.fEndMHz, cfg.dfMHz, cfg.PRP, cfg.chipLength, ...
         metric.scanTimeSec, metric.heightResolutionKm, metric.resolutionCost, metric.EsCoverage, ...
-        metric.integrationGainDb, metric.observabilityScore, metric.nFreq, cost, breakdown.utility, breakdown.penalty, ...
+        metric.integrationGainDb, metric.observabilityScore, metric.complexityCost, metric.nFreq, cost, breakdown.utility, breakdown.penalty, ...
         cons.feasible, cons.optimizationFeasible, nsgaRank, crowdingDistance, constraintViolation, generation};
 end
 
 function T = es_candidate_table_from_rows(rows)
-    T = cell2table(rows, 'VariableNames', {'codeType','codeLength','Ncoh','fStartMHz','fEndMHz','dfMHz','PRP','chipLength','scanTimeSec','heightResolutionKm','resolutionCost','EsCoverage','integrationGainDb','observabilityScore','nFreq','cost','utility','penalty','feasible','optimizationFeasible','nsgaRank','crowdingDistance','constraintViolation','generation'});
+    T = cell2table(rows, 'VariableNames', {'codeType','codeLength','Ncoh','fStartMHz','fEndMHz','dfMHz','PRP','chipLength','scanTimeSec','heightResolutionKm','resolutionCost','EsCoverage','integrationGainDb','observabilityScore','complexityCost','nFreq','cost','utility','penalty','feasible','optimizationFeasible','nsgaRank','crowdingDistance','constraintViolation','generation'});
 end
 
 function pop = initialize_nsga2_population(popSize, initialCfg, target, pref)
@@ -1804,9 +1778,10 @@ function pop = initialize_nsga2_population(popSize, initialCfg, target, pref)
     seedX = cfg_to_nsga2_x(initialCfg, target, pref);
     reqLow = target.iriPriorRangeMHz(1);
     reqHigh = target.iriPriorRangeMHz(2);
-    lowNcoh = max(pref.NcohIntegerRange(1), pref.minPreferredNcoh);
-    midNcoh = max(lowNcoh, 12);
-    highNcoh = min(pref.NcohIntegerRange(2), 32);
+    lowNcoh = pref.NcohIntegerRange(1);
+    midNcoh = min(max(16, pref.NcohIntegerRange(1)), pref.NcohIntegerRange(2));
+    weakNcoh = min(max(28, pref.NcohIntegerRange(1)), pref.NcohIntegerRange(2));
+    highNcoh = min(max(32, pref.NcohIntegerRange(1)), pref.NcohIntegerRange(2));
     nCode = numel(pref.codeLengthSet);
 
     seedRows = [
@@ -1814,6 +1789,8 @@ function pop = initialize_nsga2_population(popSize, initialCfg, target, pref)
         reqLow, reqHigh, min(0.25, b.hi(3)), 8e-3, min(20e-6, b.hi(5)), lowNcoh, 1;
         reqLow, reqHigh, min(0.16, b.hi(3)), 8e-3, min(14e-6, b.hi(5)), max(lowNcoh, 6), 1;
         reqLow, reqHigh, min(0.10, b.hi(3)), max(10e-3, b.lo(4)), b.lo(5), max(lowNcoh, 10), 1;
+        reqLow, reqHigh, min(0.05, b.hi(3)), 8e-3, min(10e-6, b.hi(5)), max(lowNcoh, 10), 1;
+        reqLow, reqHigh, min(0.05, b.hi(3)), 8e-3, min(12e-6, b.hi(5)), weakNcoh, 1;
         b.hi(1), b.lo(2), b.hi(3), b.lo(4), b.hi(5), lowNcoh, 1;                 % fastest practical edge
         b.lo(1), b.hi(2), b.lo(3), b.hi(4), b.lo(5), highNcoh, 1;                % precision edge
         b.lo(1), b.hi(2), min(0.08, b.hi(3)), b.hi(4), b.lo(5), highNcoh, nCode; % height-stable edge
@@ -1851,27 +1828,8 @@ function b = nsga2_bounds(target, pref)
     reqLow = target.requiredRangeMHz(1);
     reqHigh = target.requiredRangeMHz(2);
     pb = pref.bounds;
-    if get_opt(pref, 'freezeFrequencyWindow', false)
-        fStartLo = reqLow;
-        fStartHi = reqLow;
-        fEndLo = reqHigh;
-        fEndHi = reqHigh;
-    else
-        fStartLo = max(pb.fStartMHz(1), reqLow - pref.target.iriPriorStartFlexMHz);
-        fStartHi = min(pb.fStartMHz(2), reqLow);
-        fEndLo = max(pb.fEndMHz(1), reqHigh);
-        fEndHi = min(pb.fEndMHz(2), reqHigh + pref.target.iriPriorEndFlexMHz);
-    end
-    if fStartHi < fStartLo
-        fStartLo = pb.fStartMHz(1);
-        fStartHi = pb.fStartMHz(2);
-    end
-    if fEndHi < fEndLo
-        fEndLo = pb.fEndMHz(1);
-        fEndHi = pb.fEndMHz(2);
-    end
-    b.lo = [fStartLo, fEndLo, pb.dfMHz(1), pb.PRP(1), pb.chipLength(1), pref.NcohIntegerRange(1), 1];
-    b.hi = [fStartHi, fEndHi, pb.dfMHz(2), pb.PRP(2), pb.chipLength(2), pref.NcohIntegerRange(2), numel(pref.codeLengthSet)];
+    b.lo = [reqLow, reqHigh, pb.dfMHz(1), pb.PRP(1), pb.chipLength(1), pref.NcohIntegerRange(1), 1];
+    b.hi = [reqLow, reqHigh, pb.dfMHz(2), pb.PRP(2), pb.chipLength(2), pref.NcohIntegerRange(2), numel(pref.codeLengthSet)];
 end
 
 function x = cfg_to_nsga2_x(cfg, target, pref)
@@ -1884,15 +1842,13 @@ end
 function x = repair_nsga2_x(x, target, pref)
     b = nsga2_bounds(target, pref);
     x = min(max(x, b.lo), b.hi);
-    if x(2) <= x(1) + 0.30
-        x(2) = min(b.hi(2), x(1) + 0.30);
-        if x(2) <= x(1) + 0.30
-            x(1) = max(b.lo(1), x(2) - 0.30);
-        end
-    end
+    x(1) = target.requiredRangeMHz(1);
+    x(2) = target.requiredRangeMHz(2);
     x(6) = round((round(x(6)) - pref.NcohIntegerRange(1)) / pref.NcohSearchStep) * pref.NcohSearchStep + pref.NcohIntegerRange(1);
     x(6) = min(max(x(6), pref.NcohIntegerRange(1)), pref.NcohIntegerRange(2));
     x(7) = min(max(round(x(7)), 1), numel(pref.codeLengthSet));
+    x(1) = target.requiredRangeMHz(1);
+    x(2) = target.requiredRangeMHz(2);
 end
 
 function eval = evaluate_nsga2_population(pop, baseCfg, target, pref, generation)
@@ -1936,15 +1892,15 @@ end
 function obj = task_objective_vector(metric, cfg, pref)
     switch get_opt(pref, 'objectiveMode', 'balanced')
         case 'fast'
-            obj = [metric.scanTimeSec, -metric.EsCoverage, -metric.observabilityScore];
+            obj = [metric.scanTimeSec, -metric.observabilityScore, metric.complexityCost];
         case 'foes'
             obj = [cfg.dfMHz, metric.scanTimeSec, -metric.integrationGainDb];
         case 'height'
-            obj = [metric.heightResolutionKm, metric.scanTimeSec, -metric.integrationGainDb];
+            obj = [metric.heightResolutionKm, -metric.integrationGainDb, metric.scanTimeSec];
         case 'weak'
             obj = [-metric.observabilityScore, -metric.integrationGainDb, metric.scanTimeSec];
         case 'full_trace'
-            obj = [-metric.EsCoverage, metric.resolutionCost, metric.scanTimeSec, -metric.observabilityScore];
+            obj = [cfg.dfMHz, metric.resolutionCost, -metric.observabilityScore, metric.scanTimeSec];
         otherwise
             obj = [metric.scanTimeSec, metric.resolutionCost, -metric.observabilityScore];
     end
@@ -1976,13 +1932,60 @@ function v = es_constraint_violation(cfg, metric, cons, target, pref)
     v = v + max(0, metric.dutyRatio - pref.maxDutyRatio) / pref.maxDutyRatio;
     v = v + max(0, metric.heightResolutionKm - pref.maxPreferredHeightResolutionKm) / pref.maxPreferredHeightResolutionKm;
     v = v + max(0, pref.minPreferredNcoh - cfg.Ncoh) / max(pref.minPreferredNcoh, 1);
-    v = v + max(0, pref.minEsCoverage - metric.EsCoverage);
     v = v + max(0, pref.minIntegrationGainDb - metric.integrationGainDb) / max(pref.minIntegrationGainDb, eps);
     v = v + max(0, pref.minFrequencySamples - metric.nFreq) / pref.minFrequencySamples;
-    initialSpan = max(target.requiredRangeMHz(2) - target.requiredRangeMHz(1), pref.target.minSpanMHz);
-    v = v + max(0, pref.maxAggressiveShrinkRatio*initialSpan - max(cfg.fEndMHz - cfg.fStartMHz, cfg.dfMHz)) / max(initialSpan, eps);
+    v = v + task_baseline_violation(metric, cfg, pref);
     if ~cons.pulseFits, v = v + 1; end
     if ~cons.codeLengthOK, v = v + 1; end
+end
+
+function [v, status] = task_baseline_violation(metric, cfg, pref)
+    v = 0;
+    status = struct();
+    if ~isfield(pref, 'taskProfile') || ~isfield(pref.taskProfile, 'baseline')
+        status.ok = true;
+        return;
+    end
+    b = pref.taskProfile.baseline;
+    if isfield(b, 'maxScanTimeSec')
+        d = max(0, metric.scanTimeSec - b.maxScanTimeSec) / max(b.maxScanTimeSec, eps);
+        v = v + d;
+        status.maxScanTimeOK = d <= 1e-12;
+    end
+    if isfield(b, 'scanTimeRatioToInitial') && isfield(pref.taskProfile, 'initialScanTimeSec') && isfinite(pref.taskProfile.initialScanTimeSec)
+        limit = b.scanTimeRatioToInitial * pref.taskProfile.initialScanTimeSec;
+        d = max(0, metric.scanTimeSec - limit) / max(limit, eps);
+        v = v + d;
+        status.scanTimeRatioOK = d <= 1e-12;
+        status.scanTimeRatioLimitSec = limit;
+    end
+    if isfield(b, 'minFrequencySamples')
+        d = max(0, b.minFrequencySamples - metric.nFreq) / max(b.minFrequencySamples, eps);
+        v = v + d;
+        status.minFrequencySamplesOK = d <= 1e-12;
+    end
+    if isfield(b, 'minIntegrationGainDb')
+        d = max(0, b.minIntegrationGainDb - metric.integrationGainDb) / max(abs(b.minIntegrationGainDb), eps);
+        v = v + d;
+        status.minIntegrationGainOK = d <= 1e-12;
+    end
+    if isfield(b, 'minObservabilityScore')
+        d = max(0, b.minObservabilityScore - metric.observabilityScore);
+        v = v + d;
+        status.minObservabilityOK = d <= 1e-12;
+    end
+    if isfield(b, 'maxDfMHz')
+        d = max(0, cfg.dfMHz - b.maxDfMHz) / max(b.maxDfMHz, eps);
+        v = v + d;
+        status.maxDfOK = d <= 1e-12;
+    end
+    if isfield(b, 'maxHeightResolutionKm')
+        d = max(0, metric.heightResolutionKm - b.maxHeightResolutionKm) / max(b.maxHeightResolutionKm, eps);
+        v = v + d;
+        status.maxHeightResolutionOK = d <= 1e-12;
+    end
+    status.violation = v;
+    status.ok = v <= 1e-12;
 end
 
 function [rank, crowd] = constrained_nsga2_rank(objectives, violation)
@@ -2135,41 +2138,31 @@ function target = build_es_target_region(initialCfg, feature, pref)
     if isfield(feature.Es, 'foEBackgroundMHz')
         bgFoE = feature.Es.foEBackgroundMHz;
     end
-    hasFoEs = isfinite(feature.Es.foEsMHz);
+    foEObs = observed_foe_from_feature(feature, bgFoE, initialCfg.dfMHz, pref.target.userMarginMHz);
+    hasFoEs = isfield(feature.Es, 'observable') && feature.Es.observable && isfinite(feature.Es.foEsMHz);
     hasBg = isfinite(bgFoE);
+    hasFoEObs = isfinite(foEObs);
     targetMode = get_opt(pref, 'targetMode', 'iri_to_foEs');
     if hasFoEs && strcmpi(targetMode, 'foEs_boundary')
-        highMargin = pref.target.foEsNarrowHighMHz;
-        if ~isfinite(highMargin)
-            highMargin = max(initialCfg.dfMHz, 0.20);
-        end
-        fStart = max(initialCfg.fStartMHz, feature.Es.foEsMHz - pref.target.foEsNarrowLowMHz);
-        fEnd = min(initialCfg.fEndMHz, feature.Es.foEsMHz + highMargin);
+        [fStart, fEnd, pointTable] = build_ranked_boundary_window(initialCfg, ...
+            {'foEs_obs'}, [feature.Es.foEsMHz], {'observed'}, pref.target.userMarginMHz);
         target.priorType = 'task-driven foEs boundary narrow window';
     elseif hasFoEs && strcmpi(targetMode, 'foEs_compact')
-        fStart = max(initialCfg.fStartMHz, feature.Es.foEsMHz - pref.target.EsMarginLowMHz);
-        fEnd = min(initialCfg.fEndMHz, feature.Es.foEsMHz + pref.target.EsMarginHighMHz);
-        if hasBg
-            fStart = min(fStart, max(initialCfg.fStartMHz, bgFoE - pref.target.BackgroundMarginMHz));
-        end
+        [fStart, fEnd, pointTable] = build_ranked_boundary_window(initialCfg, ...
+            {'foE_IRI','foEs_obs'}, [bgFoE, feature.Es.foEsMHz], {'iri','observed'}, pref.target.userMarginMHz);
         target.priorType = 'task-driven compact foEs detection window';
-    elseif hasFoEs && hasBg
-        fStart = max(initialCfg.fStartMHz, bgFoE - pref.target.BackgroundMarginMHz);
-        fEnd = min(initialCfg.fEndMHz, feature.Es.foEsMHz + pref.target.EsMarginHighMHz);
-        target.priorType = 'IRI-informed foE_bg-to-foEs window';
+    elseif hasFoEs || hasBg || hasFoEObs
+        [fStart, fEnd, pointTable] = build_e_es_ranked_boundary_window(initialCfg, feature, bgFoE, foEObs, pref.target.userMarginMHz);
+        target.priorType = 'ranked-boundary E-to-Es window without ordering assumption';
     elseif hasFoEs
-        fStart = max(initialCfg.fStartMHz, feature.Es.foEsMHz - pref.target.EsMarginLowMHz);
-        fEnd = min(initialCfg.fEndMHz, feature.Es.foEsMHz + pref.target.EsMarginHighMHz);
+        [fStart, fEnd, pointTable] = build_ranked_boundary_window(initialCfg, ...
+            {'foEs_obs'}, [feature.Es.foEsMHz], {'observed'}, pref.target.userMarginMHz);
         target.priorType = 'foEs-only fallback window';
     else
         fStart = initialCfg.fStartMHz;
         fEnd = initialCfg.fEndMHz;
+        pointTable = table();
         target.priorType = 'wide fallback window';
-    end
-    if fEnd - fStart < pref.target.minSpanMHz
-        mid = 0.5*(fStart+fEnd);
-        fStart = max(initialCfg.fStartMHz, mid - pref.target.minSpanMHz/2);
-        fEnd = min(initialCfg.fEndMHz, mid + pref.target.minSpanMHz/2);
     end
     target.requiredRangeMHz = [fStart, fEnd];
     target.iriPriorRangeMHz = [fStart, fEnd];
@@ -2179,8 +2172,80 @@ function target = build_es_target_region(initialCfg, feature, pref)
     target.hasIriPrior = hasFoEs && hasBg;
     target.foEsObservedMHz = feature.Es.foEsMHz;
     target.foEBackgroundMHz = bgFoE;
+    target.foEObservedMHz = foEObs;
     target.esExcessOverBgMHz = feature.Es.foEsMHz - bgFoE;
+    target.userMarginMHz = pref.target.userMarginMHz;
+    target.dfCoarseMHz = initialCfg.dfMHz;
+    target.frequencyBoundaryPointTable = pointTable;
     target.reason = pref.taskProfile.description;
+end
+
+function foEObs = observed_foe_from_feature(feature, foEIri, dfCoarseMHz, userMarginMHz)
+    foEObs = NaN;
+    if ~isfield(feature, 'E') || ~isfield(feature.E, 'activeMidFreqMHz')
+        return;
+    end
+    f = feature.E.activeMidFreqMHz(:);
+    if isempty(f)
+        return;
+    end
+    if isfinite(foEIri)
+        searchHalfWidth = max(dfCoarseMHz, userMarginMHz);
+        f = f(f >= foEIri - searchHalfWidth & f <= foEIri + searchHalfWidth);
+    end
+    if isempty(f)
+        return;
+    end
+    foEObs = max(f);
+end
+
+function [fStart, fEnd, pointTable] = build_e_es_ranked_boundary_window(initialCfg, feature, foEIri, foEObs, userMarginMHz)
+    names = {'foE_IRI','foE_obs','foEs_obs'};
+    values = [foEIri, foEObs, feature.Es.foEsMHz];
+    sources = {'iri','observed','observed'};
+    [fStart, fEnd, pointTable] = build_ranked_boundary_window(initialCfg, names, values, sources, userMarginMHz);
+end
+
+function [fStart, fEnd, pointTable] = build_ranked_boundary_window(initialCfg, namesIn, values, sourcesIn, userMarginMHz)
+    names = {};
+    centers = [];
+    sources = {};
+    expansion = [];
+    for i = 1:numel(values)
+        if isfinite(values(i))
+            names{end+1,1} = namesIn{i}; %#ok<AGROW>
+            centers(end+1,1) = values(i); %#ok<AGROW>
+            sources{end+1,1} = sourcesIn{i}; %#ok<AGROW>
+            expansion(end+1,1) = frequency_source_expansion(sourcesIn{i}, initialCfg.dfMHz, userMarginMHz); %#ok<AGROW>
+        end
+    end
+    if isempty(centers)
+        fStart = initialCfg.fStartMHz;
+        fEnd = initialCfg.fEndMHz;
+        pointTable = table();
+        return;
+    end
+    [minFreq, minIdx] = min(centers);
+    [maxFreq, maxIdx] = max(centers);
+    fStart = max(initialCfg.fStartMHz, minFreq - expansion(minIdx));
+    fEnd = min(initialCfg.fEndMHz, maxFreq + expansion(maxIdx));
+    isLowerBoundary = false(numel(centers),1);
+    isUpperBoundary = false(numel(centers),1);
+    isLowerBoundary(minIdx) = true;
+    isUpperBoundary(maxIdx) = true;
+    pointTable = table(string(names), centers, string(sources), expansion, isLowerBoundary, isUpperBoundary, ...
+        'VariableNames', {'name','frequencyMHz','sourceType','boundaryExpansionMHz','isLowerBoundary','isUpperBoundary'});
+end
+
+function expansionMHz = frequency_source_expansion(sourceType, dfCoarseMHz, userMarginMHz)
+    switch lower(char(string(sourceType)))
+        case 'iri'
+            expansionMHz = userMarginMHz;
+        case 'observed'
+            expansionMHz = dfCoarseMHz;
+        otherwise
+            error('Unknown frequency source type: %s', sourceType);
+    end
 end
 
 function [cost, metric, cons, breakdown] = es_strategy_cost(cfg, target, pref)
@@ -2197,7 +2262,6 @@ function [cost, metric, cons, breakdown] = es_strategy_cost(cfg, target, pref)
     pulseWidth = cfg.codeLength*cfg.chipLength;
     duty = pulseWidth/cfg.PRP;
 
-    spanMHz = max(cfg.fEndMHz - cfg.fStartMHz, cfg.dfMHz);
     targetLow = target.requiredRangeMHz(1);
     targetHigh = target.requiredRangeMHz(2);
     targetWidth = max(targetHigh - targetLow, cfg.dfMHz);
@@ -2208,14 +2272,16 @@ function [cost, metric, cons, breakdown] = es_strategy_cost(cfg, target, pref)
         integrationGainDb = integrationGainDb + 1.5;
     end
     integrationScore = normalize_score(integrationGainDb, pref.minIntegrationGainDb - 6, pref.minIntegrationGainDb + 8);
-    observabilityScore = EsCoverage * integrationScore;
+    observabilityScore = integrationScore;
     resolutionCost = 0.5*(cfg.dfMHz / pref.referenceDfMHz) + ...
         0.5*(heightResKm / pref.referenceHeightResolutionKm);
+    complexityCost = 0.15*double(is_complementary_mode(cfg)) + 0.03*(cfg.Ncoh / pref.NcohIntegerRange(2));
 
     metric = struct();
     metric.EsCoverage = EsCoverage;
     metric.integrationGainDb = integrationGainDb;
     metric.observabilityScore = observabilityScore;
+    metric.complexityCost = complexityCost;
     metric.resolutionCost = resolutionCost;
     metric.scanTimeSec = scanTime;
     metric.heightResolutionKm = heightResKm;
@@ -2268,10 +2334,7 @@ function [cost, metric, cons, breakdown] = es_strategy_cost(cfg, target, pref)
     if ~cons.NcohStable
         penalty = penalty + 0.8*(pref.minPreferredNcoh - cfg.Ncoh);
     end
-    cons.EsCoverageOK = EsCoverage >= pref.minEsCoverage;
-    if ~cons.EsCoverageOK
-        penalty = penalty + 10.0*(pref.minEsCoverage - EsCoverage);
-    end
+    cons.EsCoverageOK = EsCoverage >= 1 - 1e-9;
     cons.integrationGainOK = integrationGainDb >= pref.minIntegrationGainDb;
     if ~cons.integrationGainOK
         penalty = penalty + 0.2*(pref.minIntegrationGainDb - integrationGainDb);
@@ -2280,18 +2343,17 @@ function [cost, metric, cons, breakdown] = es_strategy_cost(cfg, target, pref)
     if ~cons.frequencySamplesOK
         penalty = penalty + 1.5*(pref.minFrequencySamples - nFreq);
     end
-    initialSpan = max(target.requiredRangeMHz(2) - target.requiredRangeMHz(1), pref.target.minSpanMHz);
-    cons.notOverShrunk = spanMHz >= pref.maxAggressiveShrinkRatio * initialSpan;
-    if ~cons.notOverShrunk
-        penalty = penalty + 3.0*(pref.maxAggressiveShrinkRatio*initialSpan - spanMHz);
-    end
+    [baselineViolation, baselineStatus] = task_baseline_violation(metric, cfg, pref);
+    cons.baseline = baselineStatus;
+    cons.baselineOK = baselineViolation <= 1e-12;
+    penalty = penalty + 6.0*baselineViolation;
     cons.codeLengthOK = (strcmpi(cfg.codeType,'barker') && cfg.codeLength==13) || (strcmpi(cfg.codeType,'complementary') && cfg.codeLength==16);
     cons.NcohInteger = abs(cfg.Ncoh-round(cfg.Ncoh)) < 1e-12;
     cons.feasible = cons.targetCovered && cons.heightUnambiguous && cons.pulseFits && cons.scanTimeOK && cons.dutyOK && cons.codeLengthOK && cons.NcohInteger;
-    cons.optimizationFeasible = cons.feasible && cons.adaptiveScanPractical && cons.dfStable && cons.EsCoverageOK && cons.integrationGainOK && cons.frequencySamplesOK && cons.notOverShrunk && cons.heightResolutionStable && cons.NcohStable;
+    cons.optimizationFeasible = cons.feasible && cons.adaptiveScanPractical && cons.dfStable && cons.EsCoverageOK && cons.integrationGainOK && cons.frequencySamplesOK && cons.heightResolutionStable && cons.NcohStable && cons.baselineOK;
 
     % Es-only 中互补码低旁瓣不是主导偏好，加入复杂度/时长修正，避免无意义偏向互补码。
-    complexityPenalty = 0.15*double(is_complementary_mode(cfg)) + 0.03*(cfg.Ncoh/48);
+    complexityPenalty = complexityCost;
     preferredCode = get_opt(pref, 'preferredCodeType', 'none');
     if strcmpi(preferredCode, 'complementary') && is_complementary_mode(cfg)
         complexityPenalty = max(0, complexityPenalty - 0.12);
@@ -2311,15 +2373,15 @@ function utility = task_utility_score(metric, cfg, pref)
     gainNorm = normalize_score(metric.integrationGainDb, pref.minIntegrationGainDb - 6, pref.minIntegrationGainDb + 8);
     switch get_opt(pref, 'objectiveMode', 'balanced')
         case 'fast'
-            utility = 0.70*metric.EsCoverage + 0.30*metric.observabilityScore - 0.55*scanNorm - 0.05*dfNorm;
+            utility = 0.45*metric.observabilityScore - 0.55*scanNorm - 0.08*metric.complexityCost - 0.05*dfNorm;
         case 'foes'
-            utility = 0.55*metric.EsCoverage + 0.30*gainNorm - 0.60*dfNorm - 0.18*scanNorm;
+            utility = 0.30*gainNorm - 0.60*dfNorm - 0.18*scanNorm;
         case 'height'
             utility = 0.45*metric.observabilityScore + 0.30*gainNorm - 0.55*hNorm - 0.12*scanNorm;
         case 'weak'
             utility = 0.55*metric.observabilityScore + 0.45*gainNorm - 0.16*scanNorm - 0.10*dfNorm;
         case 'full_trace'
-            utility = 0.55*metric.EsCoverage + 0.35*metric.observabilityScore - 0.16*dfNorm - 0.12*hNorm - 0.12*scanNorm;
+            utility = 0.35*metric.observabilityScore - 0.26*dfNorm - 0.12*hNorm - 0.12*scanNorm;
         otherwise
             utility = metric.observabilityScore - 0.08*metric.resolutionCost - 0.02*metric.scanTimeSec;
     end
@@ -2333,7 +2395,7 @@ function T = build_es_optimizer_reason_table(cfg, severity, target, metric, brea
         sprintf('%.3f，由初探foEs通过连续软阈值得到', severity.Es); ...
         task_objective_description(target.taskMode); ...
         sprintf('%.3f MHz', target.foEBackgroundMHz); ...
-        sprintf('[%.3f, %.3f] MHz，覆盖初探Es与IRI背景E参考', target.requiredRangeMHz(1), target.requiredRangeMHz(2)); ...
+        sprintf('[%.3f, %.3f] MHz，寻优前由任务模式固定生成；NSGA-II不优化扫频起止频率', target.requiredRangeMHz(1), target.requiredRangeMHz(2)); ...
         sprintf('%s-%d', cfg.codeType, cfg.codeLength); ...
         sprintf('%d，整数取值', cfg.Ncoh); ...
         sprintf('%.2f dB', metric.integrationGainDb); ...
@@ -2351,7 +2413,7 @@ end
 function text = task_objective_description(taskMode)
     switch taskMode
         case 'fast_detection'
-            text = '快速告警：优先最小扫描时间，同时保持最低Es覆盖和可观测性';
+            text = '快速告警：优先最小扫描时间、可观测性和低复杂度，覆盖率仅作固定窗口校验';
         case 'foes_read'
             text = 'foEs精读：围绕foEs边界窄扫，优先最小df、兼顾扫描时间和积累增益';
         case 'height_stable'
@@ -2359,7 +2421,7 @@ function text = task_objective_description(taskMode)
         case 'weak_es_visibility'
             text = '弱Es增强：优先可观测性和积累/编码增益，扫描时间上限放宽';
         case 'full_trace'
-            text = '完整形态：优先目标窗口覆盖、轨迹上下文、分辨率和可观测性';
+            text = '完整形态：优先频点充分、分辨率和可观测性，覆盖率仅作固定窗口校验';
         otherwise
             text = '综合平衡：扫描时间、分辨率代价和Es可观测性三个紧凑目标';
     end

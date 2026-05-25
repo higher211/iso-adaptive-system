@@ -1,56 +1,65 @@
-# Es寻优主干轻量重构设计
+# Es任务驱动复探寻优主干设计
 
-## 目标
+## 1. 系统定位
 
-本文档定义偶发E层自适应复探系统进入寻优阶段后的主干整理方案。前一阶段已经确定：复探扫频范围应当在寻优前生成并固定，不能再作为 NSGA-II 的优化变量。
+本系统不寻找适用于所有偶发E层（Es）探测任务的唯一最优策略，而是构建一个任务驱动的自适应复探策略寻优框架。
 
-因此，新的寻优阶段逻辑是：
+核心思想是：
 
 ```text
-初探特征 + IRI背景先验 + 用户任务模式
+固定扫频范围；
+统一工程可行域；
+不同任务模式使用不同基线约束和目标偏好；
+NSGA-II 在统一可行域内生成 Pareto 候选；
+系统再按任务偏好选择最终推荐策略。
+```
+
+这样可以避免“不同模式靠改变搜索范围得到不同结果”的问题。不同模式的差异来自评价标准，而不是来自人为改动可行域。
+
+## 2. 主流程
+
+```text
+初探电离图
 ↓
-生成固定复探扫频范围
+特征提取：foE_obs、foEs_obs、初扫df、SNR、连续性等
+↓
+IRI背景先验：foE_IRI
+↓
+按任务模式生成固定复探扫频范围
 ↓
 冻结 fStartMHz / fEndMHz
 ↓
-NSGA-II 只优化探测策略参数
+在统一可行域内生成初始种群
 ↓
-输出该任务模式下的 Pareto 折中策略
+NSGA-II 迭代生成候选策略
+↓
+按模式基线约束筛选可接受候选
+↓
+形成 Pareto 前沿
+↓
+按模式偏好选择最终策略
 ```
 
-系统不再寻找一个适用于所有场景的唯一最优策略，而是在用户给定任务需求和固定物理工程约束下，给出对应模式的 Pareto 候选和推荐策略。
+## 3. 固定扫频范围
 
-## 修改范围
-
-本次采用“方案二：轻量重构寻优主干”。
-
-修改范围保持在当前主 MATLAB 文件内：
-
-- `code/es_only_adaptive_sounding_system.m`
-
-本阶段不进行大规模拆文件。这样可以降低路径依赖和函数调用变化带来的风险，同时把当前论文/仿真需要的主干逻辑整理清楚。
-
-## 寻优阶段固定输入
-
-NSGA-II 进入前，系统已经得到以下固定上下文：
-
-- `initialCfg`：初探策略配置，包括初扫扫频步进。
-- `initialFeature`：由初探电离图提取出的 Es/E层特征。
-- `pref.taskMode`：用户选择的任务模式。
-- `target.requiredRangeMHz`：已经按任务模式生成的固定复探扫频范围。
-
-其中：
+扫频范围在 NSGA-II 前生成，不进入寻优过程。
 
 ```text
-target.requiredRangeMHz(1) = 固定 fStartMHz
-target.requiredRangeMHz(2) = 固定 fEndMHz
+fStartMHz = target.requiredRangeMHz(1)
+fEndMHz   = target.requiredRangeMHz(2)
 ```
 
-这两个值只作为寻优输入，不进入寻优搜索。
+NSGA-II 内部可以继续保留七维染色体接口：
 
-## 寻优变量
+```text
+[fStartMHz, fEndMHz, dfMHz, PRP, chipLength, Ncoh, codeIndex]
+```
 
-NSGA-II 只允许优化以下参数：
+但前两维必须被固定为目标窗口边界。交叉、变异、修复和最终候选生成都不能改变它们。
+
+## 4. 统一搜索范围
+
+所有模式共享同一个工程/物理可行域：
 
 ```text
 dfMHz
@@ -60,19 +69,260 @@ Ncoh
 codeType / codeLength
 ```
 
-为减少对现有代码结构的扰动，内部染色体可以继续保留七维形式：
+不同任务模式不再覆盖：
 
 ```text
-[fStartMHz, fEndMHz, dfMHz, PRP, chipLength, Ncoh, codeIndex]
+bounds.dfMHz
+bounds.chipLength
+codeTypeSet
+NcohIntegerRange
 ```
 
-但 `fStartMHz` 和 `fEndMHz` 的上下界必须被强制固定为 `target.requiredRangeMHz`，并且在初始化、交叉、变异、修复和最终候选生成中都不能发生实际变化。
+这些参数范围由系统设备能力和物理工程约束统一给出。任务模式只改变评价方式，不改变可行域。
 
-换句话说，七维染色体只是保留现有接口形式，真实可变维度只有五类策略参数。
+## 5. 规则种子与随机采样
 
-## 候选策略评价指标
+NSGA-II 初始种群由两部分构成：
 
-每个候选策略需要计算以下指标：
+```text
+1. 统一规则种子策略；
+2. 统一可行域内的拉丁超立方采样。
+```
+
+规则种子不是最终答案，也不是人为指定的最优解。它们只是具有物理意义的搜索起点，用于覆盖典型策略区域：
+
+```text
+快速策略种子：较大df、较低Ncoh、简单码型；
+频率精细种子：较小df、中等Ncoh；
+高增益种子：较高Ncoh、互补码；
+高度分辨率种子：较短chipLength；
+综合折中种子：中等df、中等Ncoh、中等chipLength。
+```
+
+所有模式使用同一套规则种子和同一套随机采样机制。不同模式的结果不同，是因为它们后续使用不同基线约束、目标偏好和 Pareto 选择规则。
+
+## 6. 覆盖率的角色
+
+由于扫频范围已经固定，`EsCoverage` 不再作为优化目标。
+
+在正确实现下，每个候选策略都应覆盖同一个固定窗口，因此：
+
+```text
+EsCoverage ≈ 1
+```
+
+它只保留为一致性检查：
+
+```text
+optimizedCfg.fStartMHz == target.requiredRangeMHz(1)
+optimizedCfg.fEndMHz   == target.requiredRangeMHz(2)
+```
+
+如果覆盖率异常，说明固定窗口约束被破坏，而不是说明某个策略在目标函数上更优。
+
+## 7. 模式基线约束
+
+基线约束不是最优解，也不是改变搜索范围。它定义的是某个任务模式下“最低可接受策略”。
+
+基线来源分三类：
+
+```text
+1. 物理/工程硬约束：
+   高度不模糊、占空比、脉冲宽度、码型合法、Ncoh整数等。
+
+2. 初扫相对基线：
+   例如复探扫描时间应相对初扫明显降低。
+
+3. 数据可用性基线：
+   例如最低频点数、最低积累增益、最低可观测性。
+```
+
+基线通过 `constraintViolation` 进入 NSGA-II。违反基线的候选不会被直接删除，而是在约束支配排序中处于劣势。
+
+## 8. 各模式评价逻辑
+
+### 8.1 快速告警模式 fast
+
+任务目标：
+
+```text
+尽快判断 Es 是否出现。
+```
+
+基线倾向：
+
+```text
+扫描时间应明显短于初扫；
+频点数不能少到失去基本判断能力；
+积累增益和可观测性达到最低可用水平。
+```
+
+目标偏好：
+
+```text
+min scanTimeSec
+max observabilityScore
+min complexityCost
+```
+
+### 8.2 foEs精读模式
+
+任务目标：
+
+```text
+提高 Es 截止频率 foEs 的读取精度。
+```
+
+基线倾向：
+
+```text
+频点数足够支撑边界读取；
+扫描时间不超过可接受上限；
+边界回波积累增益达标。
+```
+
+目标偏好：
+
+```text
+min dfMHz
+min scanTimeSec
+max integrationGainDb
+```
+
+### 8.3 h'Es稳定读取模式
+
+任务目标：
+
+```text
+稳定读取 Es 虚高 h'Es。
+```
+
+基线倾向：
+
+```text
+高度分辨率满足虚高读取要求；
+PRP 对应不模糊高度满足探测高度；
+扫描时间可接受。
+```
+
+目标偏好：
+
+```text
+min heightResolutionKm
+max integrationGainDb
+min scanTimeSec
+```
+
+### 8.4 弱Es增强模式
+
+任务目标：
+
+```text
+弱回波场景下优先保证 Es 可观测。
+```
+
+基线倾向：
+
+```text
+积累增益和可观测性要求更高；
+扫描时间可适当放宽。
+```
+
+目标偏好：
+
+```text
+max observabilityScore
+max integrationGainDb
+min scanTimeSec
+```
+
+### 8.5 完整形态观测模式 full_trace
+
+任务目标：
+
+```text
+研究 Es 轨迹形态和频率结构。
+```
+
+基线倾向：
+
+```text
+固定窗口内频点数较多；
+df 不能太粗；
+积累增益达标。
+```
+
+目标偏好：
+
+```text
+min dfMHz
+min resolutionCost
+max observabilityScore
+min scanTimeSec
+```
+
+### 8.6 综合平衡模式 balanced
+
+任务目标：
+
+```text
+在扫描效率、分辨率和可观测性之间取得折中。
+```
+
+基线倾向：
+
+```text
+扫描时间、频率分辨率、高度分辨率和积累增益达到中等可用水平。
+```
+
+目标偏好：
+
+```text
+min scanTimeSec
+min resolutionCost
+max observabilityScore
+```
+
+## 9. 关键函数职责
+
+### `make_es_task_profile`
+
+只定义：
+
+```text
+objectiveMode
+selectionMode
+baseline
+```
+
+不再定义或覆盖：
+
+```text
+bounds
+codeTypeSet
+codeLengthSet
+NcohIntegerRange
+```
+
+### `task_objective_vector`
+
+根据任务模式生成目标向量。
+
+不再使用 `EsCoverage`，只使用当前模式真正关心的指标：
+
+```text
+scanTimeSec
+dfMHz
+heightResolutionKm
+integrationGainDb
+observabilityScore
+resolutionCost
+complexityCost
+```
+
+### `es_strategy_cost`
+
+负责把候选策略参数转换为评价指标：
 
 ```text
 scanTimeSec
@@ -81,218 +331,60 @@ heightResolutionKm
 hAmbKm
 dutyRatio
 integrationGainDb
-EsCoverage
 observabilityScore
 resolutionCost
+complexityCost
 ```
 
-这些指标同时服务于三件事：
+### `es_constraint_violation`
+
+负责计算约束违反量：
 
 ```text
-1. 构造不同任务模式下的多目标向量；
-2. 判断候选策略是否满足工程/物理约束；
-3. 在 Pareto 候选中选择最终推荐策略。
+硬约束违反量
+固定窗口一致性违反量
+模式基线违反量
 ```
 
-## 约束条件
-
-寻优阶段应检查以下约束：
+同时移除范围收缩类旧逻辑：
 
 ```text
-1. 固定目标扫频窗口必须被完整覆盖；
-2. 总扫描时间不能超过系统硬上限；
-3. 扫描时间应满足任务模式的自适应复探上限；
-4. 频点数不能低于任务模式要求；
-5. EsCoverage 不能低于任务模式要求；
-6. 积累增益不能低于任务模式要求；
-7. PRP 对应的不模糊高度必须满足最大探测高度要求；
-8. 占空比不能超过工程上限；
-9. 编码脉冲宽度加保护时间必须小于 PRP；
-10. 码型与码长必须匹配；
-11. Ncoh 必须是合法整数搜索值。
+maxAggressiveShrinkRatio
+notOverShrunk
 ```
 
-由于扫频窗口已经固定，和“压缩扫频范围”相关的约束应当删除或失效。例如 `maxAggressiveShrinkRatio` 只在 `fStartMHz/fEndMHz` 参与寻优时有意义；现在窗口不可收缩，它不应该再影响候选策略可行性。
+### `select_task_pareto_row`
 
-## 不同任务模式的目标函数
+从满足基线的 Pareto 候选中按模式偏好选择最终策略。
 
-不同模式使用不同的多目标向量。
-
-### 快速告警模式
-
-目标：
+它不改变策略，只负责推荐：
 
 ```text
-min scanTimeSec
-max EsCoverage
-max observabilityScore
+fast       → 更快且可观测性达标；
+foEs       → df更小且边界增益达标；
+hEs        → 高度分辨率更高；
+weakEs     → 可观测性和积累增益更强；
+full_trace → 频点更充分、分辨率更好；
+balanced   → 扫描时间、分辨率和可观测性折中。
 ```
 
-含义：尽快判断 Es 是否出现，允许分辨率适当降低，但不能失去基本覆盖和可观测性。
+## 10. 最终结论
 
-### foEs精读模式
-
-目标：
+最终系统应表达为：
 
 ```text
-min dfMHz
-min scanTimeSec
-max integrationGainDb
+统一搜索空间；
+统一规则种子；
+统一随机采样；
+不同模式使用不同基线约束；
+不同模式使用不同目标偏好；
+不同模式使用不同 Pareto 推荐规则。
 ```
 
-含义：围绕初探 foEs 边界进行窄扫，重点提高频率分辨率，同时保证边界回波有足够积累增益。
-
-### h'Es稳定读取模式
-
-目标：
+一句话概括：
 
 ```text
-min heightResolutionKm
-min scanTimeSec
-max integrationGainDb
-```
-
-含义：重点提高虚高读取稳定性，优先选择更短 chipLength 和足够的相干积累。
-
-### 弱Es增强模式
-
-目标：
-
-```text
-max observabilityScore
-max integrationGainDb
-min scanTimeSec
-```
-
-含义：Es 较弱时，优先保证“看得见”，允许扫描时间相对放宽。
-
-### 完整形态观测模式
-
-目标：
-
-```text
-max EsCoverage
-min resolutionCost
-min scanTimeSec
-max observabilityScore
-```
-
-含义：面向 Es 完整轨迹形态研究，强调窗口覆盖、轨迹连续性、分辨率和可观测性的综合表现。
-
-### 综合平衡模式
-
-目标：
-
-```text
-min scanTimeSec
-min resolutionCost
-max observabilityScore
-```
-
-含义：在扫描效率、分辨率和 Es 可观测性之间寻找折中点。
-
-## Pareto候选与最终推荐
-
-NSGA-II 负责产生受约束的 Pareto 候选集合。最终推荐策略不通过人为给所有指标强行加权得到，而是按任务模式进行排序选择：
-
-```text
-fast       → 优先扫描时间，再看覆盖率和可观测性
-foEs       → 优先 df，再看扫描时间和积累增益
-hEs        → 优先高度分辨率，再看积累增益和扫描时间
-weakEs     → 优先可观测性和积累增益
-full_trace → 优先覆盖率、频点数和综合分辨率
-balanced   → 在低扫描时间候选中选择覆盖、分辨率和可观测性较平衡的点
-```
-
-这样可以避免把所有模式都压成同一个“全局最优”问题，而是保留“任务需求驱动”的系统定位。
-
-## 需要清理的代码点
-
-本次实现重点检查和清理以下位置：
-
-```text
-1. nsga2_bounds
-   明确固定 fStartMHz/fEndMHz 的上下界。
-
-2. repair_nsga2_x
-   确保修复逻辑不会为了最小频宽等旧规则改动固定窗口。
-
-3. initialize_nsga2_population
-   种群初始化中所有 seed 都必须使用固定 target 范围。
-
-4. mutate_nsga2_x / crossover_mutate_nsga2
-   即使交叉变异触碰到前两维，修复后也必须回到固定窗口。
-
-5. es_constraint_violation 与 es_strategy_cost
-   删除或失效只服务于“扫频范围收缩寻优”的约束。
-
-6. select_strategy_from_pareto_candidates
-   保留按任务模式选择 Pareto 推荐策略的逻辑，并确保不改变扫频范围。
-
-7. build_es_optimizer_reason_table
-   输出解释应改为“固定任务扫频窗口 + 策略参数寻优”。
-```
-
-## 验证要求
-
-实现完成后，需要进行以下验证：
-
-```text
-1. MATLAB 静态/语法检查；
-2. 分别运行全部任务模式：
-   fast
-   foEs
-   hEs
-   weakEs
-   full_trace
-   balanced
-```
-
-每个模式都需要确认：
-
-```text
-1. target.requiredRangeMHz 在 NSGA-II 前已经生成；
-2. optimizedCfg.fStartMHz == target.requiredRangeMHz(1)；
-3. optimizedCfg.fEndMHz   == target.requiredRangeMHz(2)；
-4. NSGA-II 实际只改变 dfMHz、PRP、chipLength、Ncoh 和码型；
-5. 最终策略满足主要约束；
-6. 如果某模式无法完全满足约束，需要输出具体未满足的约束项。
-```
-
-## 不在本次范围内的内容
-
-本次不处理以下内容：
-
-```text
-1. 不重新设计已经确认的扫频范围生成规则；
-2. 不加入 blanketing Es 逻辑；
-3. 不把主 MATLAB 文件拆成多个文件；
-4. 不修改 IRI 背景先验获取方式；
-5. 不修改初探电离图特征提取流程，除非发现它直接破坏寻优输入。
-```
-
-## 最终预期效果
-
-完成后，系统主干应表达为：
-
-```text
-特征提取与IRI背景先验
-↓
-按任务模式生成固定复探扫频范围
-↓
-进入 NSGA-II 参数寻优
-↓
-生成 Pareto 候选
-↓
-按任务偏好选择推荐策略
-↓
-输出策略参数、约束状态和推荐理由
-```
-
-这使系统定位更加清晰：
-
-```text
-不是寻找唯一绝对最优的 Es 探测策略，
-而是在用户任务需求和固定工程约束下，
-寻找对应模式的 Pareto 折中复探策略。
+规则种子和搜索空间统一，任务基线和偏好分化；
+NSGA-II 在统一可行域中生成候选，
+不同模式用不同评价标准筛选 Pareto 策略。
 ```
