@@ -551,6 +551,12 @@ function pref = make_es_optimizer_preference()
     pref.nsga2.mutationProbability = 0.18;
     pref.nsga2.seed = 20260515;
 
+    % Ablation switches used by supplemental experiments.
+    pref.ablation.disableTaskBaseline = false;
+    pref.ablation.disableRuleSeeds = false;
+    pref.ablation.disableIriPrior = false;
+    pref.ablation.unifiedObjective = false;
+
     % 任务/物理约束。
     pref.maxScanTimeSec = 20;
     pref.maxHeightKm = 900;
@@ -1531,6 +1537,10 @@ function pref = resolve_es_task_preference(pref, initialCfg, initialFeature)
     if ~isfield(pref.target, 'userMarginMHz') || ~isfinite(pref.target.userMarginMHz)
         pref.target.userMarginMHz = 0.50;
     end
+    if isfield(pref, 'ablation') && get_opt(pref.ablation, 'unifiedObjective', false)
+        pref.objectiveMode = 'balanced';
+        pref.selectionMode = 'balanced';
+    end
     profile.effectiveTaskMode = mode;
     profile.initialFoEsMHz = initialFeature.Es.foEsMHz;
     profile.initialDfMHz = initialCfg.dfMHz;
@@ -1784,20 +1794,24 @@ function pop = initialize_nsga2_population(popSize, initialCfg, target, pref)
     highNcoh = min(max(32, pref.NcohIntegerRange(1)), pref.NcohIntegerRange(2));
     nCode = numel(pref.codeLengthSet);
 
-    seedRows = [
-        seedX;
-        reqLow, reqHigh, min(0.25, b.hi(3)), 8e-3, min(20e-6, b.hi(5)), lowNcoh, 1;
-        reqLow, reqHigh, min(0.16, b.hi(3)), 8e-3, min(14e-6, b.hi(5)), max(lowNcoh, 6), 1;
-        reqLow, reqHigh, min(0.10, b.hi(3)), max(10e-3, b.lo(4)), b.lo(5), max(lowNcoh, 10), 1;
-        reqLow, reqHigh, min(0.05, b.hi(3)), 8e-3, min(10e-6, b.hi(5)), max(lowNcoh, 10), 1;
-        reqLow, reqHigh, min(0.05, b.hi(3)), 8e-3, min(12e-6, b.hi(5)), weakNcoh, 1;
-        b.hi(1), b.lo(2), b.hi(3), b.lo(4), b.hi(5), lowNcoh, 1;                 % fastest practical edge
-        b.lo(1), b.hi(2), b.lo(3), b.hi(4), b.lo(5), highNcoh, 1;                % precision edge
-        b.lo(1), b.hi(2), min(0.08, b.hi(3)), b.hi(4), b.lo(5), highNcoh, nCode; % height-stable edge
-        b.lo(1), b.hi(2), min(0.20, b.hi(3)), b.hi(4), min(28e-6, b.hi(5)), highNcoh, nCode;
-        b.hi(1), b.hi(2), min(0.28, b.hi(3)), 8e-3, min(16e-6, b.hi(5)), midNcoh, 1;
-        b.lo(1), b.lo(2), min(0.28, b.hi(3)), 8e-3, min(16e-6, b.hi(5)), midNcoh, 1
-    ];
+    if isfield(pref, 'ablation') && get_opt(pref.ablation, 'disableRuleSeeds', false)
+        seedRows = zeros(0, nVar);
+    else
+        seedRows = [
+            seedX;
+            reqLow, reqHigh, min(0.25, b.hi(3)), 8e-3, min(20e-6, b.hi(5)), lowNcoh, 1;
+            reqLow, reqHigh, min(0.16, b.hi(3)), 8e-3, min(14e-6, b.hi(5)), max(lowNcoh, 6), 1;
+            reqLow, reqHigh, min(0.10, b.hi(3)), max(10e-3, b.lo(4)), b.lo(5), max(lowNcoh, 10), 1;
+            reqLow, reqHigh, min(0.05, b.hi(3)), 8e-3, min(10e-6, b.hi(5)), max(lowNcoh, 10), 1;
+            reqLow, reqHigh, min(0.05, b.hi(3)), 8e-3, min(12e-6, b.hi(5)), weakNcoh, 1;
+            b.hi(1), b.lo(2), b.hi(3), b.lo(4), b.hi(5), lowNcoh, 1;
+            b.lo(1), b.hi(2), b.lo(3), b.hi(4), b.lo(5), highNcoh, 1;
+            b.lo(1), b.hi(2), min(0.08, b.hi(3)), b.hi(4), b.lo(5), highNcoh, nCode;
+            b.lo(1), b.hi(2), min(0.20, b.hi(3)), b.hi(4), min(28e-6, b.hi(5)), highNcoh, nCode;
+            b.hi(1), b.hi(2), min(0.28, b.hi(3)), 8e-3, min(16e-6, b.hi(5)), midNcoh, 1;
+            b.lo(1), b.lo(2), min(0.28, b.hi(3)), 8e-3, min(16e-6, b.hi(5)), midNcoh, 1
+        ];
+    end
 
     nSeed = min(size(seedRows,1), popSize);
     pop(1:nSeed,:) = seedRows(1:nSeed,:);
@@ -1942,6 +1956,11 @@ end
 function [v, status] = task_baseline_violation(metric, cfg, pref)
     v = 0;
     status = struct();
+    if isfield(pref, 'ablation') && get_opt(pref.ablation, 'disableTaskBaseline', false)
+        status.ok = true;
+        status.disabled = true;
+        return;
+    end
     if ~isfield(pref, 'taskProfile') || ~isfield(pref.taskProfile, 'baseline')
         status.ok = true;
         return;
@@ -2137,6 +2156,9 @@ function target = build_es_target_region(initialCfg, feature, pref)
     bgFoE = NaN;
     if isfield(feature.Es, 'foEBackgroundMHz')
         bgFoE = feature.Es.foEBackgroundMHz;
+    end
+    if isfield(pref, 'ablation') && get_opt(pref.ablation, 'disableIriPrior', false)
+        bgFoE = NaN;
     end
     foEObs = observed_foe_from_feature(feature, bgFoE, initialCfg.dfMHz, pref.target.userMarginMHz);
     hasFoEs = isfield(feature.Es, 'observable') && feature.Es.observable && isfinite(feature.Es.foEsMHz);

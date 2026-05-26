@@ -38,6 +38,7 @@ function summaryTable = run_es_batch_validation(opts)
     maxGenerations = get_batch_opt(opts, 'maxGenerations', defaultGenerations);
     nSubRays = get_batch_opt(opts, 'nSubRays', 5);
     truthFreqStepMHz = get_batch_opt(opts, 'truthFreqStepMHz', 1.0);
+    userPrefPatch = get_batch_opt(opts, 'userPrefPatch', struct());
     outputPath = char(string(get_batch_opt(opts, 'outputPath', fullfile('outputs', 'batch_validation_summary.csv'))));
     if isempty(fileparts(outputPath))
         outputPath = fullfile(pwd, outputPath);
@@ -58,6 +59,7 @@ function summaryTable = run_es_batch_validation(opts)
                 runOpt = struct();
                 runOpt.quiet = true;
                 runOpt.userPref.taskMode = mode;
+                runOpt.userPref = merge_batch_structs(runOpt.userPref, userPrefPatch);
                 runOpt.sceneSpec.Es.foEsExcessOverIriEMHz = intensityCfg.foEsExcessOverIriEMHz;
                 runOpt.sceneSpec.Es.foEsSigmaMHz = intensityCfg.foEsSigmaMHz;
                 runOpt.sceneSpec.Es.reflectivity = intensityCfg.reflectivity;
@@ -136,6 +138,21 @@ function v = get_batch_opt(s, name, defaultValue)
         v = s.(name);
     else
         v = defaultValue;
+    end
+end
+
+function s = merge_batch_structs(s, patch)
+    if ~isstruct(patch)
+        return;
+    end
+    names = fieldnames(patch);
+    for i = 1:numel(names)
+        name = names{i};
+        if isfield(s, name) && isstruct(s.(name)) && isstruct(patch.(name))
+            s.(name) = merge_batch_structs(s.(name), patch.(name));
+        else
+            s.(name) = patch.(name);
+        end
     end
 end
 

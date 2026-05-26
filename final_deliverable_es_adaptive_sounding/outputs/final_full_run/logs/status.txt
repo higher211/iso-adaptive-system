@@ -1,0 +1,8 @@
+2026-05-25 12:09:47 START full-scale run
+2026-05-25 12:09:47 STEP 1 main final 1800 starts
+2026-05-25 14:43:24 STEP 1 main final 1800 finished
+2026-05-25 14:43:24 STEP 2 sci supplement final starts
+2026-05-25 17:17:35 RESTART sci supplement final starts
+2026-05-26 09:46:58 RESTART sci supplement final starts
+2026-05-26 18:47:20 RESTART sci supplement final matlab exit code=0
+2026-05-26 18:47:20 RESTART sci supplement final finished
